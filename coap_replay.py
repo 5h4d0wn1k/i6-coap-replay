@@ -1,86 +1,108 @@
 #!/usr/bin/env python3
-"""CoAP Replay Tool - Packet crafting, GET/POST/PUT replay, observe abuse, resource enumeration."""
+"""
+I6 - CoAP Replay Tool
+Real CoAP message assembly over UDP (CON/NON, token, blocks, options) with a
+mocked loopback CoAP server for replay + injection testing. Standard-library only.
+"""
 
 import socket
 import struct
 import hashlib
 import argparse
 import sys
+import os
+import json
+import threading
 import time
 import random
+import re
+
+
+VERSION = 1
+TYPES = {0: "CON", 1: "NON", 2: "ACK", 3: "RST"}
+CODES = {
+    0x01: "GET", 0x02: "POST", 0x03: "PUT", 0x04: "DELETE",
+    0x41: "2.01 Created", 0x42: "2.02 Deleted", 0x43: "2.04 Changed",
+    0x44: "2.05 Content", 0x45: "2.03 Not Modified",
+    0x60: "4.00 Bad Request", 0x61: "4.01 Unauthorized",
+    0x62: "4.02 Bad Option", 0x63: "4.03 Forbidden",
+    0x64: "4.04 Not Found", 0x65: "4.05 Method Not Allowed",
+    0x80: "5.00 Internal Server Error", 0x81: "5.01 Not Implemented",
+    0x82: "5.02 Bad Gateway", 0x83: "5.03 Service Unavailable",
+}
+OPTION_NUMBERS = {
+    1: "If-Match", 3: "Uri-Host", 4: "ETag", 5: "If-None-Match",
+    7: "Uri-Port", 8: "Location-Path", 11: "Uri-Path", 12: "Content-Format",
+    14: "Max-Age", 15: "Accept", 17: "Location-Query", 20: "Proxy-Uri",
+    23: "Size1", 256: "Observe", 271: "Block2", 273: "Block1",
+    308: "Size2", 65001: "No-Response",
+}
+METHODS = {0x01: "GET", 0x02: "POST", 0x03: "PUT", 0x04: "DELETE"}
+
+
+def _decode_option_ext(ext, data, offset):
+    if ext == 13:
+        return 13 + data[offset], offset + 1
+    elif ext == 14:
+        return 269 + struct.unpack(">H", data[offset:offset + 2])[0], offset + 2
+    return ext, offset
 
 
 class CoAPMessage:
-    VERSION = 1
-    TYPES = {0: "CON", 1: "NON", 2: "ACK", 3: "RST"}
-    CODES = {
-        0x01: "GET", 0x02: "POST", 0x03: "PUT", 0x04: "DELETE",
-        0x41: "2.01 Created", 0x42: "2.02 Deleted", 0x43: "2.04 Changed",
-        0x44: "2.05 Content", 0x45: "2.03 Not Modified",
-        0x60: "4.00 Bad Request", 0x61: "4.01 Unauthorized",
-        0x62: "4.02 Bad Option", 0x63: "4.03 Forbidden",
-        0x64: "4.04 Not Found", 0x65: "4.05 Method Not Allowed",
-        0x80: "5.00 Internal Server Error", 0x81: "5.01 Not Implemented",
-        0x82: "5.02 Bad Gateway", 0x83: "5.03 Service Unavailable",
-    }
-    OPTION_NUMBERS = {
-        1: "If-Match", 3: "Uri-Host", 4: "ETag", 5: "If-None-Match",
-        7: "Uri-Port", 8: "Location-Path", 11: "Uri-Path", 12: "Content-Format",
-        14: "Max-Age", 15: "Accept", 17: "Location-Query", 20: "Proxy-Uri",
-        23: "Size1", 256: "Observe", 271: "Block2", 273: "Block1",
-        308: "Size2", 65001: "No-Response",
-    }
-
     def __init__(self, msg_type="CON", code="GET", token=None, payload=None):
-        self.msg_type = self.TYPES.get(msg_type, msg_type) if isinstance(msg_type, str) else msg_type
-        self.code = self.CODES.get(code, code) if isinstance(code, str) else code
-        self.token = token or random.randbytes(random.randint(0, 8))
+        self.msg_type = TYPES.get(msg_type, msg_type)
+        self.code_init = CODES.get(code, code) if isinstance(code, str) else code
+        self.token = token if token is not None else b""
         self.message_id = random.randint(0, 0xFFFF)
         self.options = []
-        self.payload = payload or b""
+        self.payload = payload if payload is not None else b""
         self.content_format = None
 
-    @property
+    def is_request(self):
+        return isinstance(self.code_init, int) and self.code_init < 0x40
+
     def type_int(self):
-        for k, v in self.TYPES.items():
+        for k, v in TYPES.items():
             if v == self.msg_type:
                 return k
         return 0
 
-    @property
     def code_int(self):
-        for k, v in self.CODES.items():
-            if v == self.code:
+        for k, v in CODES.items():
+            if v == self.code_init:
                 return k
-        if isinstance(self.code, int):
-            return self.code
+        if isinstance(self.code_init, int):
+            return self.code_init
         return 0x01
 
     def add_option(self, opt_num, value):
         if isinstance(value, str):
             value = value.encode()
-        if opt_num == 12 and self.content_format is None:
-            self.content_format = value
+        if opt_num == 12 and self.content_format is None and isinstance(value, bytes):
+            try:
+                if len(value) == 1:
+                    self.content_format = value[0]
+                elif len(value) == 2:
+                    self.content_format = struct.unpack(">H", value)[0]
+            except (struct.error, IndexError):
+                pass
         self.options.append((opt_num, value))
 
     def add_uri_path(self, path):
         for segment in path.strip("/").split("/"):
-            self.add_option(11, segment)
-
-    def add_uri_host(self, host):
-        self.add_option(3, host)
+            if segment:
+                self.add_option(11, segment)
 
     def add_observe(self, register=True):
-        val = b"\x00" if register else b"\x01"
-        self.add_option(256, val)
+        self.add_option(256, b"\x00" if register else b"\x01")
 
     def set_content_format(self, fmt):
         self.content_format = fmt
-        self.add_option(12, struct.pack(">H", fmt) if isinstance(fmt, int) else fmt)
+        self.add_option(12, struct.pack(">H", fmt))
 
     def encode(self):
-        first_byte = (self.VERSION << 6) | (self.type_int << 4) | len(self.token)
-        code_byte = self.code_int
+        first_byte = (VERSION << 6) | (self.type_int() << 4) | len(self.token)
+        code_byte = self.code_int()
         self.options.sort(key=lambda x: x[0])
         opts_encoded = b""
         prev_opt_num = 0
@@ -89,10 +111,12 @@ class CoAPMessage:
             length = len(opt_val)
             opts_encoded += self._encode_option_ext(delta, length) + opt_val
             prev_opt_num = opt_num
-        marker = 0xFF
         header = struct.pack(">BBH", first_byte, code_byte, self.message_id)
         token_bytes = self.token[:8]
-        return header + token_bytes + opts_encoded + (b"" if not self.payload else struct.pack("B", marker) + self.payload)
+        out = header + token_bytes + opts_encoded
+        if self.payload:
+            out += struct.pack("B", 0xFF) + self.payload
+        return out
 
     def _encode_option_ext(self, delta, length):
         d = delta & 0x0F
@@ -105,8 +129,7 @@ class CoAPMessage:
             l = 13
         elif length >= 269:
             l = 14
-        header = (d << 4) | l
-        result = struct.pack("B", header)
+        result = struct.pack("B", (d << 4) | l)
         if d == 13:
             result += struct.pack("B", delta - 13)
         elif d == 14:
@@ -123,6 +146,8 @@ class CoAPMessage:
             return None
         first_byte = data[0]
         version = (first_byte >> 6) & 0x03
+        if version != 1:
+            return None
         msg_type = (first_byte >> 4) & 0x03
         token_len = first_byte & 0x0F
         code_byte = data[1]
@@ -139,32 +164,116 @@ class CoAPMessage:
             delta_ext = (b >> 4) & 0x0F
             len_ext = b & 0x0F
             offset += 1
-            if delta_ext == 13:
-                delta = 13 + data[offset]; offset += 1
-            elif delta_ext == 14:
-                delta = 269 + struct.unpack(">H", data[offset:offset + 2])[0]; offset += 2
-            else:
-                delta = delta_ext
-            if len_ext == 13:
-                length = 13 + data[offset]; offset += 1
-            elif len_ext == 14:
-                length = 269 + struct.unpack(">H", data[offset:offset + 2])[0]; offset += 2
-            else:
-                length = len_ext
+            delta, offset = _decode_option_ext(delta_ext, data, offset)
+            length, offset = _decode_option_ext(len_ext, data, offset)
             opt_val = data[offset:offset + length]
             offset += length
             opt_num = prev_opt_num + delta
             options.append((opt_num, opt_val))
             prev_opt_num = opt_num
-        payload = data[offset:] if offset < len(data) else b""
+        payload = data[offset:]
         msg = cls()
-        msg.msg_type = cls.TYPES.get(msg_type, msg_type)
-        msg.code_int = code_byte
+        msg.msg_type = TYPES.get(msg_type, msg_type)
+        msg.code_init = code_byte
         msg.token = token
         msg.message_id = msg_id
         msg.options = options
         msg.payload = payload
         return msg
+
+    def get_option(self, opt_num):
+        return [v for n, v in self.options if n == opt_num]
+
+    def uri_path(self):
+        parts = [v.decode(errors="ignore") for n, v in self.options if n == 11]
+        return "/" + "/".join(parts)
+
+
+class MockCoAPServer:
+    """Loopback CoAP server over UDP that serves fixed resources."""
+
+    RESOURCES = {
+        "/time": b"23.450",
+        "/temp": b"22.5",
+        "/sensors": b"</sensors/temp>;rt=\"temperature\"",
+        "/sensors/temp": b"22.5",
+        "/actuators/led": b"OFF",
+        "/.well-known/core": (
+            b'</sensors/temp>;rt="temperature";ct=0,'
+            b'</actuators/led>;rt="led";ct=0,'
+            b'</time>;rt="time";ct=0'
+        ),
+    }
+
+    def __init__(self, host="127.0.0.1", port=0):
+        self.host = host
+        self.port = port
+        self.sock = None
+        self._thread = None
+        self.running = False
+        self.requests = []
+        self.notify_count = 0
+
+    def start(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.host, self.port))
+        self.sock.settimeout(0.5)
+        self.port = self.sock.getsockname()[1]
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self.port
+
+    def stop(self):
+        self.running = False
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def _loop(self):
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(4096)
+                self._handle(data, addr)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+    def _handle(self, data, addr):
+        req = CoAPMessage.decode(data)
+        if req is None:
+            return
+        self.requests.append(req)
+        path = req.uri_path() or "/"
+        self._send_response(req, addr, path)
+
+    def _send_response(self, req, addr, path):
+        resp = CoAPMessage("ACK", "2.05 Content", token=req.token)
+        resp.message_id = req.message_id
+        if path == "/actuators/led" and req.code_int() == 0x02:
+            resp.code_init = 0x44
+            resp.payload = b"OK"
+        elif path in self.RESOURCES:
+            resp.code_init = 0x44
+            resp.payload = self.RESOURCES[path]
+            if self._has_observe(req):
+                self.notify_count += 1
+        elif path == "/.well-known/core":
+            resp.code_init = 0x44
+            resp.payload = self.RESOURCES[path]
+        else:
+            resp.code_init = 0x64
+            resp.payload = b"Not Found"
+        # required: CoAP responses should not echo request path unless options needed
+        self.sock.sendto(resp.encode(), addr)
+
+    def _has_observe(self, req):
+        return any(n == 256 for n, _ in req.options)
 
 
 class CoAPClient:
@@ -172,65 +281,148 @@ class CoAPClient:
         self.host = host
         self.port = port
         self.timeout = timeout
-        self.sock = None
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(self.timeout)
-
-    def close(self):
-        if self.sock:
-            self.sock.close()
-            self.sock = None
 
     def send_receive(self, msg):
-        self.connect()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(self.timeout)
         data = msg.encode()
-        self.sock.sendto(data, (self.host, self.port))
+        sock.sendto(data, (self.host, self.port))
         try:
-            resp_data, addr = self.sock.recvfrom(4096)
-            self.close()
-            return CoAPMessage.decode(resp_data), addr
+            resp_data, _ = sock.recvfrom(4096)
+            return CoAPMessage.decode(resp_data)
         except socket.timeout:
-            self.close()
-            return None, None
+            return None
+        finally:
+            sock.close()
 
     def get(self, path, observe=False):
-        msg = CoAPMessage("CON", "GET")
+        msg = CoAPMessage("CON", "GET", token=b"\xab\xcd")
         msg.add_uri_path(path)
         if observe:
             msg.add_observe(True)
         return self.send_receive(msg)
 
     def post(self, path, payload, content_format=0):
-        msg = CoAPMessage("CON", "POST")
+        msg = CoAPMessage("CON", "POST", token=b"\x01\x02")
         msg.add_uri_path(path)
         msg.set_content_format(content_format)
         msg.payload = payload.encode() if isinstance(payload, str) else payload
         return self.send_receive(msg)
 
     def put(self, path, payload, content_format=0):
-        msg = CoAPMessage("CON", "PUT")
+        msg = CoAPMessage("CON", "PUT", token=b"\x03\x04")
         msg.add_uri_path(path)
         msg.set_content_format(content_format)
         msg.payload = payload.encode() if isinstance(payload, str) else payload
         return self.send_receive(msg)
 
     def delete(self, path):
-        msg = CoAPMessage("CON", "DELETE")
+        msg = CoAPMessage("CON", "DELETE", token=b"\x05\x06")
         msg.add_uri_path(path)
         return self.send_receive(msg)
 
     def replay(self, raw_packet):
-        self.connect()
-        self.sock.sendto(raw_packet, (self.host, self.port))
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(self.timeout)
+        sock.sendto(raw_packet, (self.host, self.port))
         try:
-            resp_data, addr = self.sock.recvfrom(4096)
-            self.close()
-            return CoAPMessage.decode(resp_data), addr
+            resp_data, _ = sock.recvfrom(4096)
+            return CoAPMessage.decode(resp_data)
         except socket.timeout:
-            self.close()
-            return None, None
+            return None
+        finally:
+            sock.close()
+
+
+def run_demo(host="127.0.0.1", report_dir="reports"):
+    print("=== I6 - CoAP Replay Tool (Offline Demo) ===")
+    server = MockCoAPServer(host, 0)
+    server_port = server.start()
+    print("[+] Mock CoAP server on 127.0.0.1:%d" % server_port)
+
+    results = {"host": host, "port": server_port, "messages": [], "errors": []}
+    client = CoAPClient(host, server_port, timeout=2)
+
+    try:
+        print("\n[*] GET /sensors/temp...")
+        resp = client.get("/sensors/temp")
+        if resp:
+            print("[+] GET /sensors/temp -> %s (%d bytes): %s" % (
+                resp_code_label(resp), len(resp.payload),
+                resp.payload.decode(errors="ignore")))
+            results["messages"].append({"method": "GET", "path": "/sensors/temp",
+                                        "code": resp_code_label(resp),
+                                        "payload": resp.payload.decode(errors="ignore")})
+        else:
+            results["messages"].append({"method": "GET", "path": "/sensors/temp", "code": "no-response"})
+
+        print("\n[*] POST /actuators/led (injection)...")
+        resp2 = client.post("/actuators/led", "ON")
+        if resp2:
+            print("[+] %s (%d bytes): %s" % (resp_code_label(resp2),
+                                             len(resp2.payload), resp2.payload.decode(errors="ignore")))
+            results["messages"].append({"method": "POST", "path": "/actuators/led",
+                                        "code": resp_code_label(resp2)})
+
+        print("\n[*] GET /.well-known/core (resource discovery)...")
+        resp3 = client.get("/.well-known/core")
+        if resp3:
+            print("[+] %s -> %s" % (resp_code_label(resp3),
+                                    resp3.payload.decode(errors="ignore")))
+            results["messages"].append({"method": "GET", "path": "/.well-known/core",
+                                        "code": resp_code_label(resp3)})
+
+        print("\n[*] Replay captured packet (CON GET /time)...")
+        captured = CoAPMessage("CON", "GET", token=b"\x99")
+        captured.add_uri_path("/time")
+        raw = captured.encode()
+        print("[+] Captured %d bytes: %s" % (len(raw), raw.hex()))
+        replay_resp = client.replay(raw)
+        if replay_resp:
+            print("[+] Replay -> %s: %s" % (resp_code_label(replay_resp),
+                                            replay_resp.payload.decode(errors="ignore")))
+            results["replay"] = {"raw": raw.hex(),
+                                 "code": resp_code_label(replay_resp),
+                                 "payload": replay_resp.payload.decode(errors="ignore")}
+
+        print("\n[*] Observe registration (abuse check)...")
+        msg = CoAPMessage("CON", "GET", token=b"\x70")
+        msg.add_uri_path("/sensors/temp")
+        msg.add_observe(True)
+        obs_resp = client.send_receive(msg)
+        results["observe"] = {"registered": server.notify_count > 0,
+                              "server_observations": server.notify_count}
+        if server.notify_count > 0:
+            print("[+] Observe option reached server")
+
+        print("\n[*] Block transfer check (CON GET /time with Block2)...")
+        block_msg = CoAPMessage("CON", "GET", token=b"\x11")
+        block_msg.add_uri_path("/time")
+        block_msg.add_option(271, struct.pack(">B", 0x00))  # Block2 num=0 more=0 size=16
+        block_response = client.send_receive(block_msg)
+        if block_response:
+            print("[+] Blocked GET -> %s" % resp_code_label(block_response))
+            results["block"] = resp_code_label(block_response)
+
+    except Exception as e:
+        results["errors"].append(str(e))
+        print("[-] Demo error: %s" % e)
+    finally:
+        server.stop()
+
+    os.makedirs(report_dir, exist_ok=True)
+    rpath = os.path.join(report_dir, "i6_demo_report.json")
+    with open(rpath, "w") as f:
+        json.dump(results, f, indent=2)
+    print("\n[+] Report: %s" % rpath)
+    print("[+] Demo complete — exit 0")
+    return 0
+
+
+def resp_code_label(resp):
+    if resp is None:
+        return "no-response"
+    return CODES.get(resp.code_int(), "0x%02X" % resp.code_int())
 
 
 class ObserveAbuser:
@@ -239,24 +431,17 @@ class ObserveAbuser:
         self.captured = []
 
     def register_observers(self, path, count=5):
-        print(f"[*] Registering {count} observers on {path}")
         for i in range(count):
-            resp, addr = self.client.get(path, observe=True)
+            resp = self.client.get(path, observe=True)
             if resp:
-                token_hex = resp.token.hex()
-                print(f"  Observer {i + 1}: token={token_hex}, type={resp.msg_type}")
-                self.captured.append(resp)
-            else:
-                print(f"  Observer {i + 1}: no response")
-            time.sleep(0.2)
+                self.captured.append(resp.token.hex())
+        return self.captured
 
     def forge_notification(self, observer_msg, new_payload):
-        forged = CoAPMessage("CON", "2.05 Content")
-        forged.token = observer_msg.token
-        forged.message_id = random.randint(0, 0xFFFF)
+        forged = CoAPMessage("CON", "2.05 Content", token=observer_msg.token)
         forged.add_option(256, b"\x01")
         forged.set_content_format(0)
-        forged.payload = new_payload.encode() if isinstance(new_payload, str) else new_payload
+        forged.payload = new_payload.encode()
         return forged
 
 
@@ -272,149 +457,181 @@ class ResourceEnumerator:
         self.client = client
 
     def discover(self, base_path=".well-known/core"):
-        print(f"[*] Discovering resources via {base_path}")
-        resp, _ = self.client.get(base_path)
+        resp = self.client.get(base_path)
         if resp and resp.payload:
-            resources = self._parse_link_format(resp.payload.decode(errors="ignore"))
-            print(f"  Found {len(resources)} resource(s):")
-            for r in resources:
-                print(f"    {r}")
-            return resources
-        print("  No resources found via core link format")
+            return self._parse_link_format(resp.payload.decode(errors="ignore"))
         return []
 
     def brute_paths(self, paths=None):
         paths = paths or self.COMMON_PATHS
-        print(f"[*] Brute-forcing {len(paths)} paths...")
         found = []
         for path in paths:
-            resp, _ = self.client.get(path)
-            if resp and not resp.is_error():
-                status = resp.code_int
-                label = CoAPMessage.CODES.get(status, str(status))
-                print(f"  [+] {path} -> {label} ({len(resp.payload)} bytes)")
-                found.append((path, resp))
-            else:
-                print(f"  [-] {path} -> no response")
-            time.sleep(0.1)
+            resp = self.client.get(path)
+            if resp and resp.code_int() < 0x60:
+                found.append(path)
         return found
 
     def _parse_link_format(self, data):
         resources = []
-        for match in __import__("re").finditer(r'<([^>]+)>((?:;[^>]+)*)', data):
-            path = match.group(1)
-            attrs = match.group(2)
-            resources.append({"path": path, "attrs": attrs})
+        entries = []
+        current = ""
+        in_quotes = False
+        for ch in data:
+            if ch == '"':
+                in_quotes = not in_quotes
+            if ch == "," and not in_quotes:
+                entries.append(current)
+                current = ""
+            else:
+                current += ch
+        if current.strip():
+            entries.append(current)
+        for e in entries:
+            m = re.match(r"<([^>]+)>(.*)", e.strip())
+            if m:
+                resources.append({"path": m.group(1), "attrs": m.group(2)})
         return resources
-
-    def _is_error(self):
-        return self.code_int >= 0x60
-
-
-def replay_captures(client, packets):
-    print(f"[*] Replaying {len(packets)} captured packet(s)")
-    for i, pkt in enumerate(packets):
-        resp, addr = client.replay(pkt)
-        if resp:
-            code = CoAPMessage.CODES.get(resp.code_int, f"0x{resp.code_int:02X}")
-            print(f"  Replay {i + 1}: {code} ({len(resp.payload)} bytes)")
-        else:
-            print(f"  Replay {i + 1}: no response")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CoAP Replay Tool")
-    parser.add_argument("host", nargs="?", help="Target CoAP server")
-    parser.add_argument("-p", "--port", type=int, default=5683, help="CoAP port (default 5683)")
-    parser.add_argument("-t", "--timeout", type=int, default=3, help="Timeout in seconds")
+    parser = argparse.ArgumentParser(
+        description="I6 - CoAP Replay Tool (educational, authorized use only)",
+        epilog="Example: python3 coap_replay.py 127.0.0.1 -p 5683 --get /sensors/temp",
+    )
+    parser.add_argument("--demo", action="store_true",
+                        help="Run offline demo with loopback mock CoAP server")
+    parser.add_argument("host", nargs="?", default="127.0.0.1",
+                        help="Target CoAP server (default 127.0.0.1)")
+    parser.add_argument("-p", "--port", type=int, default=5683,
+                        help="CoAP port (default 5683)")
+    parser.add_argument("-t", "--timeout", type=int, default=3,
+                        help="Timeout seconds")
     parser.add_argument("--get", help="GET request to path")
-    parser.add_argument("--post", nargs=2, metavar=("PATH", "DATA"), help="POST data to path")
-    parser.add_argument("--put", nargs=2, metavar=("PATH", "DATA"), help="PUT data to path")
+    parser.add_argument("--post", nargs=2, metavar=("PATH", "DATA"),
+                        help="POST data to path")
+    parser.add_argument("--put", nargs=2, metavar=("PATH", "DATA"),
+                        help="PUT data to path")
     parser.add_argument("--delete", help="DELETE path")
-    parser.add_argument("--observe", action="store_true", help="Register observe on --get path")
-    parser.add_argument("--abuse-observe", nargs=2, metavar=("PATH", "COUNT"), help="Register multiple observers")
-    parser.add_argument("--enumerate", action="store_true", help="Enumerate resources")
-    parser.add_argument("--brute", action="store_true", help="Brute-force common paths")
-    parser.add_argument("--replay", nargs="+", metavar="HEX", help="Replay raw CoAP packets (hex-encoded)")
-    parser.add_argument("--craft", nargs=3, metavar=("TYPE", "CODE", "PATH"), help="Craft a raw packet")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--observe", action="store_true",
+                        help="Register observe on --get path")
+    parser.add_argument("--abuse-observe", nargs=2, metavar=("PATH", "COUNT"),
+                        help="Register multiple observers")
+    parser.add_argument("--enumerate", action="store_true",
+                        help="Enumerate resources via .well-known/core")
+    parser.add_argument("--brute", action="store_true",
+                        help="Brute-force common paths")
+    parser.add_argument("--replay", nargs="+", metavar="HEX",
+                        help="Replay raw CoAP packets (hex-encoded)")
+    parser.add_argument("--craft", nargs=3, metavar=("TYPE", "CODE", "PATH"),
+                        help="Craft a raw packet")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose")
+    parser.add_argument("--json", action="store_true",
+                        help="Write JSON report to reports/")
+    parser.add_argument("--report-dir", default="reports",
+                        help="Report output directory (default reports/)")
     args = parser.parse_args()
 
-    if not args.host:
+    if args.demo:
+        sys.exit(run_demo(report_dir=args.report_dir))
+
+    if not any([args.get, args.post, args.put, args.delete, args.abuse_observe,
+                args.enumerate, args.brute, args.replay, args.craft]):
         parser.print_help()
-        return
+        sys.exit(0)
 
     client = CoAPClient(args.host, args.port, args.timeout)
+    results = {"host": args.host, "port": args.port, "messages": []}
 
     if args.get:
-        resp, addr = client.get(args.get, observe=args.observe)
+        resp = client.get(args.get, observe=args.observe)
         if resp:
-            code = CoAPMessage.CODES.get(resp.code_int, f"0x{resp.code_int:02X}")
-            print(f"[GET {args.get}] {code}")
+            print("[GET %s] %s" % (args.get, resp_code_label(resp)))
             if resp.payload:
-                print(f"Payload ({len(resp.payload)} bytes): {resp.payload.decode(errors='ignore')[:500]}")
+                print("Payload (%d bytes): %s" % (
+                    len(resp.payload), resp.payload.decode(errors="ignore")[:500]))
             if args.verbose:
-                print(f"  Token: {resp.token.hex()}")
-                print(f"  Type: {resp.msg_type}, MID: {resp.message_id}")
+                print("  Token: %s" % resp.token.hex())
+                print("  Type: %s, MID: %d" % (resp.msg_type, resp.message_id))
+            results["messages"].append({"method": "GET", "path": args.get,
+                                        "code": resp_code_label(resp)})
         else:
             print("No response")
 
     if args.post:
         path, data = args.post
-        resp, _ = client.post(path, data)
+        resp = client.post(path, data)
         if resp:
-            code = CoAPMessage.CODES.get(resp.code_int, f"0x{resp.code_int:02X}")
-            print(f"[POST {path}] {code}")
+            print("[POST %s] %s" % (path, resp_code_label(resp)))
             if resp.payload:
-                print(f"Payload: {resp.payload.decode(errors='ignore')[:500]}")
+                print("Payload: %s" % resp.payload.decode(errors="ignore")[:500])
+            results["messages"].append({"method": "POST", "path": path,
+                                        "code": resp_code_label(resp)})
 
     if args.put:
         path, data = args.put
-        resp, _ = client.put(path, data)
+        resp = client.put(path, data)
         if resp:
-            code = CoAPMessage.CODES.get(resp.code_int, f"0x{resp.code_int:02X}")
-            print(f"[PUT {path}] {code}")
+            print("[PUT %s] %s" % (path, resp_code_label(resp)))
             if resp.payload:
-                print(f"Payload: {resp.payload.decode(errors='ignore')[:500]}")
+                print("Payload: %s" % resp.payload.decode(errors="ignore")[:500])
 
     if args.delete:
-        resp, _ = client.delete(args.delete)
+        resp = client.delete(args.delete)
         if resp:
-            code = CoAPMessage.CODES.get(resp.code_int, f"0x{resp.code_int:02X}")
-            print(f"[DELETE {args.delete}] {code}")
+            print("[DELETE %s] %s" % (args.delete, resp_code_label(resp)))
 
     if args.abuse_observe:
         path, count = args.abuse_observe
         abuser = ObserveAbuser(client)
-        abuser.register_observers(path, int(count))
+        tokens = abuser.register_observers(path, int(count))
+        print("[*] Registered %d observer(s), tokens: %s" % (len(tokens), tokens))
 
     if args.enumerate:
         enumerator = ResourceEnumerator(client)
-        enumerator.discover()
+        resources = enumerator.discover()
+        print("[*] Discovered %d resource(s):" % len(resources))
+        for r in resources:
+            print("    %s" % r)
+        results["resources"] = resources
 
     if args.brute:
         enumerator = ResourceEnumerator(client)
-        enumerator.brute_paths()
+        found = enumerator.brute_paths()
+        print("[*] Brute-force found %d accessible path(s):" % len(found))
+        for p in found:
+            print("    [+] %s" % p)
 
     if args.replay:
         packets = [bytes.fromhex(h) for h in args.replay]
-        replay_captures(client, packets)
+        print("[*] Replaying %d captured packet(s)" % len(packets))
+        for i, pkt in enumerate(packets):
+            resp = client.replay(pkt)
+            if resp:
+                print("  Replay %d: %s (%d bytes)" % (i + 1, resp_code_label(resp),
+                                                      len(resp.payload)))
+            else:
+                print("  Replay %d: no response" % (i + 1))
 
     if args.craft:
         msg_type, code, path = args.craft
         msg = CoAPMessage(msg_type, code)
         msg.add_uri_path(path)
         raw = msg.encode()
-        print(f"Crafted packet ({len(raw)} bytes): {raw.hex()}")
-        resp, _ = client.replay(raw)
+        print("Crafted packet (%d bytes): %s" % (len(raw), raw.hex()))
+        resp = client.replay(raw)
         if resp:
-            rcode = CoAPMessage.CODES.get(resp.code_int, f"0x{resp.code_int:02X}")
-            print(f"Response: {rcode}")
+            print("Response: %s" % resp_code_label(resp))
             if resp.payload:
-                print(f"Payload: {resp.payload.decode(errors='ignore')[:500]}")
+                print("Payload: %s" % resp.payload.decode(errors="ignore")[:500])
 
-    if not any([args.get, args.post, args.put, args.delete, args.abuse_observe, args.enumerate, args.brute, args.replay, args.craft]):
-        parser.print_help()
+    if args.json:
+        os.makedirs(args.report_dir, exist_ok=True)
+        rpath = os.path.join(args.report_dir, "i6_report.json")
+        with open(rpath, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print("\n[+] Report: %s" % rpath)
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":

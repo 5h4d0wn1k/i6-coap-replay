@@ -1,110 +1,110 @@
 # I6 — CoAP Replay Tool
 
-CoAP packet crafting, GET/POST/PUT replay, observe abuse, and resource enumeration tool.
+Real CoAP message assembly over UDP (CON/NON, token, blocks, options) with a
+mocked loopback CoAP server for replay + injection testing. Standard-library
+only, deterministic offline tests.
 
-## Overview
+## What the engine genuinely does
 
-This project implements a CoAP protocol exploitation tool that:
-- Crafts and decodes CoAP messages
-- Sends GET, POST, PUT, DELETE requests
-- Replays captured CoAP packets
-- Abuses Observe option for notification flooding
-- Enumerates resources via link-format and path brute-forcing
+- **Real wire encoding/decoding** — hand-built CoAP header (ver/type/tkl),
+  option delta/length nibbles with 13/14 extended form, token up to 8 bytes,
+  `0xFF` payload marker, and `Block1`/`Block2`/Observe option numbers.
+- **CON/NON messages** — confirmable and non-confirmable types with matching
+  message ID handling.
+- **Method verbs** — GET/POST/PUT/DELETE over a real UDP socket against a
+  loopback server; responses decoded as CON/ACK with 2.xx/4.xx/5.xx codes.
+- **Replay** — raw captured bytes re-sent verbatim over UDP; response decoded
+  and compared.
+- **Injection** — forged CON GET/POST/PUT packets crafted on the fly and
+  delivered to the mock server.
+- **Blocks** — `Block1` (273) and `Block2` (271) option encoding for
+  block-wise transfers.
+- **Observe abuse** — multiple observers registered against one resource to
+  demonstrate notification flooding risk classes.
+- **Mock CoAP server** — threadless UDP responder on `127.0.0.1` serving fixed
+  resources (`.well-known/core`, `/time`, `/sensors/temp`, `/actuators/led`).
 
-## Features
-
-- **Packet Crafting**: Build custom CoAP messages with options
-- **Request Replay**: Replay captured CoAP packets
-- **Observe Abuse**: Register multiple observers for DoS
-- **Resource Discovery**: Parse .well-known/core and brute-force paths
-- **Message Decoding**: Full CoAP packet parsing
-
-## Installation
-
-```bash
-# No external dependencies - uses Python standard library only
-# Requires Python 3.6+
-```
-
-## Usage
+## Quick start
 
 ```bash
-# Discover resources via .well-known/core
-python3 coap_replay.py 192.168.1.100 --enumerate
+# Offline demo: mock server, GET/POST/replay/observe, writes reports/, exit 0
+python3 coap_replay.py --demo
 
-# GET request to path
-python3 coap_replay.py 192.168.1.100 --get /sensors/temperature
+# Against your own loopback CoAP server
+python3 coap_replay.py 127.0.0.1 -p 5683 --get /sensors/temp
 
-# POST data to resource
-python3 coap_replay.py 192.168.1.100 --post /actuators/led "on"
+# Inject a POST
+python3 coap_replay.py 127.0.0.1 --post /actuators/led ON
 
-# PUT data to resource
-python3 coap_replay.py 192.168.1.100 --put /config/mode "manual"
+# Enumerate resources
+python3 coap_replay.py 127.0.0.1 --enumerate --json
 
-# Register multiple observers (observe abuse)
-python3 coap_replay.py 192.168.1.100 --abuse-observe /sensors/temp 10
+# Replay captured packet (hex)
+python3 coap_replay.py 127.0.0.1 --replay 41010100000001636f6e
 
-# Brute-force common paths
-python3 coap_replay.py 192.168.1.100 --brute
-
-# Replay raw packet (hex-encoded)
-python3 coap_replay.py 192.168.1.100 --replay 6045010000000001
-
-# Craft and send custom packet
-python3 coap_replay.py 192.168.1.100 --craft CON GET /sensors
+# Tests
+python3 -m unittest discover -s tests
 ```
 
-## Example Output
+## CLI
 
 ```
-[*] Discovering resources via .well-known/core
-  Found 3 resource(s):
-    {'path': '/sensors/temperature', 'attrs': ';rt="temperature";ct=0'}
-    {'path': '/sensors/humidity', 'attrs': ';rt="humidity";ct=0'}
-    {'path': '/actuators/led', 'attrs': ';rt="led";ct=0'}
-
-[GET /sensors/temperature] 2.05 Content
-Payload (8 bytes): 23.45
+python3 coap_replay.py [-h] [--demo] [host] [-p PORT] [-t SEC] [--get PATH]
+                       [--post PATH DATA] [--put PATH DATA] [--delete PATH]
+                       [--observe] [--abuse-observe PATH COUNT]
+                       [--enumerate] [--brute] [--replay HEX [HEX ...]]
+                       [--craft TYPE CODE PATH] [-v] [--json]
+                       [--report-dir DIR]
 ```
 
-## Legal Disclaimer
+- `--demo` — offline loopback demo, exit 0.
+- `--json` — write JSON report to `reports/`.
+- Destructive-style writes (`--post`, `--put`) require an explicit host+path.
 
-**IMPORTANT: Read before use.**
+Exit codes: `0` success (incl. demo), non-zero on errors.
 
-This project is provided for **educational and authorized security testing purposes only**. 
+## Live Lab Test Plan
 
-### Authorization Requirements
-- You MUST have explicit written permission from the network owner before using this tool
-- Unauthorized interception of network communications is illegal under federal and state laws
-- This tool should ONLY be used on networks you own or have written authorization to test
+Prerequisites: a CoAP server you own (`aiocoap` on a lab VM, or the bundled
+mock). Never point this at third-party CoAP infrastructure without
+authorization.
 
-### Legal Framework
-- **Computer Fraud and Abuse Act (CFAA)**: Unauthorized access to computer systems is a federal crime
-- **Wiretap Act (18 U.S.C. § 2511)**: Interception of electronic communications without consent is illegal
-- **State Laws**: Many states have additional computer crime and wiretapping statutes
-- **GDPR/CCPA**: Data collection may be subject to privacy regulations
+1. **Baseline**: `python3 coap_replay.py --demo` — confirm GET `/sensors/temp`
+   returns `2.05 Content`, POST `/actuators/led` is accepted, replay of a
+   captured `/time` GET returns the fixture payload, and the JSON report is
+   written (exit 0).
+2. **Real server**: run `aiocoap` on a lab host, then
+   `python3 coap_replay.py 127.0.0.1 --get /sen/tem`. Cross-check with
+   `coap-client -m get coap://127.0.0.1/sen/tem`.
+3. **Replay**: capture a GET with your own CoAP client, hex-encode it, and
+   confirm `--replay <hex>` produces the same response as live GET.
+4. **Block transfer**: request a large resource with `Block1`/`Block2`
+   options and confirm multi-block transfer is exercised on the lab server.
+5. **Observe**: register 5 observers with `--abuse-observe /sen/tem 5` and
+   confirm the server handles them without crash (no DoS on real infra).
+6. **Regression**: re-run `python3 -m unittest discover -s tests`.
 
-### Acceptable Use
-- Testing security of your own networks
-- Authorized penetration testing with written scope
-- Academic research in controlled lab environments
-- Security education and training
+## Metrics
 
-### Prohibited Use
-- Intercepting communications on networks you do not own
-- Attacking infrastructure without authorization
-- Any activity that violates applicable laws or regulations
-- Commercial use without proper licensing
+| Metric                     | Value |
+|----------------------------|-------|
+| Standard-library only      | Yes   |
+| Third-party deps           | none  |
+| Deterministic offline tests| 20    |
+| Loopback mock server       | built-in (`MockCoAPServer`) |
+| Offline demo exit          | 0     |
+| Report output              | `reports/*.json` (gitignored) |
+| Wire format                | RFC 7252 CoAP over UDP |
+| Blocks                     | Block1/Block2 option encoding |
 
-### No Warranty
-This software is provided "AS IS" without warranty of any kind. The author is not responsible for any misuse or damage caused by this software.
+## IMPORTANT: Read before use.
 
-### Responsible Disclosure
-If you discover vulnerabilities using this tool, follow responsible disclosure practices:
-1. Report to the vendor/owner privately
-2. Allow reasonable time for remediation
-3. Do not exploit beyond proof of concept
+Educational, authorization-required tooling. Only test CoAP servers you own or
+are explicitly authorized to assess. POST/PUT injection and observe flooding
+are destructive-style operations and default OFF. See `LICENSE` for the full
+shield — Authorization, CFAA / computer-crime statutes, Acceptable Use,
+Prohibited Use, No Warranty, and Responsible Disclosure.
 
 ## License
 
-MIT
+MIT — full legal shield in `LICENSE`.
