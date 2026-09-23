@@ -3,39 +3,57 @@
 > or hold explicit written authorization to assess**. Unauthorized use is
 > prohibited and may be illegal. Read [ETHICS.md](ETHICS.md) and
 > [SCOPE.md](SCOPE.md) before use. Use at your own risk; **AS IS**, no warranty.
+
 # I6 — CoAP Replay Tool
 
-Real CoAP message assembly over UDP (CON/NON, token, blocks, options) with a
-mocked loopback CoAP server for replay + injection testing. Standard-library
-only, deterministic offline tests.
+**CoAP (RFC 7252) message replay and fuzz toolkit** by **5h4d0wn1k** for
+**constrained-device security testing**: hand-built wire encoding/decoding,
+GET/POST/PUT/DELETE over UDP, raw-packet replay, forged-message injection,
+Block1/Block2 block-wise transfer and Observe registration — all against a
+mocked loopback CoAP server. Standard-library only, deterministic offline
+tests.
 
-## What the engine genuinely does
+## Why this toolkit
 
-- **Real wire encoding/decoding** — hand-built CoAP header (ver/type/tkl),
-  option delta/length nibbles with 13/14 extended form, token up to 8 bytes,
-  `0xFF` payload marker, and `Block1`/`Block2`/Observe option numbers.
+CoAP is the lightweight REST protocol behind countless IoT and smart-building
+sensors, yet its plaintext-by-default UDP transport invites replay, spoofed
+state changes and observe-flooding abuse. This framework makes the protocol's
+wire format legible so defenders and authorized testers can verify that a
+resource only accepts authorized writes, that block transfers complete
+cleanly, and that Observe subscribers are bounded. Destructive-style
+operations (`--post`, `--put`, `--abuse-observe`) default OFF and require an
+explicit target path. Use it only against CoAP servers you own or hold written
+authorization to test — see [ETHICS.md](ETHICS.md) and [SCOPE.md](SCOPE.md).
+
+## Features
+
+- **Real wire encoding/decoding** — CoAP header (ver/type/tkl), option
+  delta/length nibbles with 13/14 extended form, up to 8-byte tokens, `0xFF`
+  payload marker and Block1/Block2/Observe option numbers (`CoAPMessage`).
 - **CON/NON messages** — confirmable and non-confirmable types with matching
-  message ID handling.
-- **Method verbs** — GET/POST/PUT/DELETE over a real UDP socket against a
-  loopback server; responses decoded as CON/ACK with 2.xx/4.xx/5.xx codes.
+  message-ID handling over a real UDP socket.
+- **Method verbs** — GET/POST/PUT/DELETE against a loopback server; responses
+  decoded as CON/ACK with 2.xx/4.xx/5.xx codes.
 - **Replay** — raw captured bytes re-sent verbatim over UDP; response decoded
   and compared.
-- **Injection** — forged CON GET/POST/PUT packets crafted on the fly and
-  delivered to the mock server.
-- **Blocks** — `Block1` (273) and `Block2` (271) option encoding for
-  block-wise transfers.
-- **Observe abuse** — multiple observers registered against one resource to
-  demonstrate notification flooding risk classes.
-- **Mock CoAP server** — threadless UDP responder on `127.0.0.1` serving fixed
-  resources (`.well-known/core`, `/time`, `/sensors/temp`, `/actuators/led`).
+- **Injection** — forged CON GET/POST/PUT packets crafted on the fly (`--craft`).
+- **Block-wise transfer** — `Block1` (273) and `Block2` (271) option encoding
+  for large-resource exchanges.
+- **Observe abuse** — multiple observers against one resource to demonstrate
+  notification-flooding risk classes (`--abuse-observe PATH COUNT`).
+- **Resource enumeration** — discover resources and probe handlers
+  (`--enumerate`, `--brute`).
+- **Mock CoAP server** — threadless UDP responder on `127.0.0.1` serving
+  `.well-known/core`, `/time`, `/sensors/temp` and `/actuators/led`, enabling
+  fully offline labs.
 
-## Quick start
+## Quickstart
 
 ```bash
 # Offline demo: mock server, GET/POST/replay/observe, writes reports/, exit 0
 python3 coap_replay.py --demo
 
-# Against your own loopback CoAP server
+# GET against your own loopback CoAP server
 python3 coap_replay.py 127.0.0.1 -p 5683 --get /sensors/temp
 
 # Inject a POST
@@ -44,10 +62,10 @@ python3 coap_replay.py 127.0.0.1 --post /actuators/led ON
 # Enumerate resources
 python3 coap_replay.py 127.0.0.1 --enumerate --json
 
-# Replay captured packet (hex)
+# Replay a captured packet (hex)
 python3 coap_replay.py 127.0.0.1 --replay 41010100000001636f6e
 
-# Tests
+# Run the test suite (20 deterministic offline tests)
 python3 -m unittest discover -s tests
 ```
 
@@ -62,54 +80,38 @@ python3 coap_replay.py [-h] [--demo] [host] [-p PORT] [-t SEC] [--get PATH]
                        [--report-dir DIR]
 ```
 
-- `--demo` — offline loopback demo, exit 0.
-- `--json` — write JSON report to `reports/`.
-- Destructive-style writes (`--post`, `--put`) require an explicit host+path.
+- `--demo` — offline loopback demo, exit `0`.
+- `--json` — write a JSON report to `reports/` (gitignored).
+- Destructive-style writes (`--post`, `--put`) require an explicit `host`
+  and `path`.
 
-Exit codes: `0` success (incl. demo), non-zero on errors.
+Exit codes: `0` on success (including the demo), non-zero on errors.
 
-## Live Lab Test Plan
+## Project structure
 
-Prerequisites: a CoAP server you own (`aiocoap` on a lab VM, or the bundled
-mock). Never point this at third-party CoAP infrastructure without
-authorization.
+```
+coap_replay.py   # wire codec, MockCoAPServer, CoAPClient, ObserveAbuser, CLI
+tests/           # unittest coverage: encoding, methods, replay, blocks, demo
+ETHICS.md        # educational-use policy (read first)
+SCOPE.md         # scope and target authorization rules
+SECURITY.md      # vulnerability disclosure
+```
 
-1. **Baseline**: `python3 coap_replay.py --demo` — confirm GET `/sensors/temp`
-   returns `2.05 Content`, POST `/actuators/led` is accepted, replay of a
-   captured `/time` GET returns the fixture payload, and the JSON report is
-   written (exit 0).
-2. **Real server**: run `aiocoap` on a lab host, then
-   `python3 coap_replay.py 127.0.0.1 --get /sen/tem`. Cross-check with
-   `coap-client -m get coap://127.0.0.1/sen/tem`.
-3. **Replay**: capture a GET with your own CoAP client, hex-encode it, and
-   confirm `--replay <hex>` produces the same response as live GET.
-4. **Block transfer**: request a large resource with `Block1`/`Block2`
-   options and confirm multi-block transfer is exercised on the lab server.
-5. **Observe**: register 5 observers with `--abuse-observe /sen/tem 5` and
-   confirm the server handles them without crash (no DoS on real infra).
-6. **Regression**: re-run `python3 -m unittest discover -s tests`.
+## Documentation
 
-## Metrics
+- [ETHICS.md](ETHICS.md) — acceptable and prohibited use.
+- [SCOPE.md](SCOPE.md) — authorized target scope.
+- [SECURITY.md](SECURITY.md) — responsible disclosure.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide.
 
-| Metric                     | Value |
-|----------------------------|-------|
-| Standard-library only      | Yes   |
-| Third-party deps           | none  |
-| Deterministic offline tests| 20    |
-| Loopback mock server       | built-in (`MockCoAPServer`) |
-| Offline demo exit          | 0     |
-| Report output              | `reports/*.json` (gitignored) |
-| Wire format                | RFC 7252 CoAP over UDP |
-| Blocks                     | Block1/Block2 option encoding |
+## Contributing
 
-## IMPORTANT: Read before use.
-
-Educational, authorization-required tooling. Only test CoAP servers you own or
-are explicitly authorized to assess. POST/PUT injection and observe flooding
-are destructive-style operations and default OFF. See `LICENSE` for the full
-shield — Authorization, CFAA / computer-crime statutes, Acceptable Use,
-Prohibited Use, No Warranty, and Responsible Disclosure.
+Replay fixtures, block-transfer test cases and decoder hardening are welcome.
+Open an issue or PR against the default branch; keep contributions scoped to
+educational and authorized-use tooling.
 
 ## License
 
-MIT — full legal shield in `LICENSE`.
+MIT — full legal shield in [LICENSE](LICENSE). Educational, authorization-
+required software for assessing CoAP infrastructure you own or are explicitly
+permitted to test.
